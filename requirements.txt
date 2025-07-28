@@ -1,1 +1,2 @@
 kucoin-python
+setuptools

@@ -1,0 +1,74 @@
+import time
+from kucoin.client import Client
+
+# ====== CONFIG ======
+API_KEY = 'TON_API_KEY'
+API_SECRET = 'TON_API_SECRET'
+API_PASSPHRASE = 'TON_API_PASSPHRASE'
+
+client = Client(API_KEY, API_SECRET, API_PASSPHRASE)
+
+# Tokens ciblés
+TOKENS = ["WIF‑USDT", "TURBO‑USDT", "PEPE‑USDT", "FET‑USDT", "GME‑USDT", "JUP‑USDT", "BONK‑USDT"]
+
+# Paramètres
+INVEST_AMOUNT = 50      # Montant à investir par token
+STOP_LOSS = -20         # En %
+TAKE_PROFIT = 50        # En %
+DELAY_SECONDS = 60
+
+positions = {}
+
+def get_price(symbol):
+    try:
+        ticker = client.get_ticker(symbol)
+        return float(ticker['price'])
+    except:
+        return None
+
+def send_telegram(message):
+    print(f"[TELEGRAM] {message}")
+    # Décommente / modifie selon ton bot Telegram si besoin
+
+def buy_token(symbol, amount_usdt):
+    price = get_price(symbol)
+    if price is None:
+        return
+    qty = round(amount_usdt / price, 5)
+    client.create_market_order(symbol, 'buy', size=str(qty))
+    positions[symbol] = {'entry': price, 'qty': qty}
+    send_telegram(f"✅ Achat {symbol} à {price:.4f} (qty: {qty})")
+
+def sell_token(symbol):
+    if symbol not in positions:
+        return
+    qty = positions[symbol]['qty']
+    client.create_market_order(symbol, 'sell', size=str(qty))
+    send_telegram(f"❌ Vente {symbol} (qty: {qty})")
+    del positions[symbol]
+
+def check_signal(symbol):
+    price = get_price(symbol)
+    if price is None:
+        return
+    ticker = client.get_ticker(symbol)
+    volume = float(ticker.get("volValue", 0))
+    if symbol not in positions and volume > 1_000_000:
+        buy_token(symbol, INVEST_AMOUNT)
+    if symbol in positions:
+        entry = positions[symbol]['entry']
+        pnl = ((price - entry) / entry) * 100
+        if pnl >= TAKE_PROFIT:
+            sell_token(symbol)
+        elif pnl <= STOP_LOSS:
+            sell_token(symbol)
+
+if __name__ == '__main__':
+    while True:
+        try:
+            for token in TOKENS:
+                check_signal(token)
+            time.sleep(DELAY_SECONDS)
+        except Exception as e:
+            send_telegram(f"⚠️ Erreur bot : {e}")
+            time.sleep(120)

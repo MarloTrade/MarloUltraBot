@@ -1,7 +1,20 @@
 import time
 import os
 from kucoin.client import Client
+import sys, logging, threading, time
 
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s', force=True)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+print("[BOOT] Script lancé", flush=True)
+
+def heartbeat():
+    while True:
+        logging.info("Heartbeat: loop OK")
+        time.sleep(15)
+
+threading.Thread(target=heartbeat, daemon=True).start()
 API_KEY = os.getenv("KUCOIN_API_KEY")
 API_SECRET = os.getenv("KUCOIN_API_SECRET")
 API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE")

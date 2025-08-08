@@ -11,10 +11,21 @@ class Ku:
         self.trade = Trade(CFG["API_KEY"], CFG["API_SECRET"], CFG["API_PASS"], is_sandbox=CFG["SANDBOX"])
 
     def time_ok(self):
-        srv = self.market.get_server_time()
+    try:
+        # certaines versions n'ont pas get_server_time()
+        if hasattr(self.market, 'get_server_time'):
+            srv = self.market.get_server_time()
+        elif hasattr(self.market, 'get_server_timestamp'):
+            srv = self.market.get_server_timestamp()
+        else:
+            self.logger.info("No server time endpoint; skipping drift check.")
+            return 0
         drift = abs(int(srv) - int(time.time()*1000))
         self.logger.info(f"Server time drift ~ {drift} ms")
         return drift
+    except Exception as e:
+        self.logger.info(f"Time check skipped: {e}")
+        return 0
 
     def accounts(self):
         accs = self.user.get_account_list()

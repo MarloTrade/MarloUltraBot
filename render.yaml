@@ -16,7 +16,7 @@ services:
       - key: KUCOIN_SANDBOX
         value: "false"
       - key: DRY_RUN
-        value: "true"
+        value: "false"
       - key: TEST_TRADE
         value: "false"
       - key: QUOTE

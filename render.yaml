@@ -1,8 +1,43 @@
 services:
-  - type: web
-    name: marlo-ultra-aggressive
+  - type: worker
+    name: marlo-trader-bot
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: bash start.sh
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
     autoDeploy: true
+    envVars:
+      - key: KUCOIN_API_KEY
+        sync: false
+      - key: KUCOIN_API_SECRET
+        sync: false
+      - key: KUCOIN_API_PASSPHRASE
+        sync: false
+      - key: KUCOIN_SANDBOX
+        value: "false"
+      - key: DRY_RUN
+        value: "true"
+      - key: TEST_TRADE
+        value: "false"
+      - key: QUOTE
+        value: "USDT"
+      - key: SYMBOLS
+        value: "BTC-USDT,ETH-USDT"
+      - key: MIN_TRADE_USDT
+        value: "10"
+      - key: RISK_PCT
+        value: "10"
+      - key: STRATEGY
+        value: "EMA_CROSS"
+      - key: POLL_INTERVAL_SEC
+        value: "30"
+      - key: ENABLE_TP_SL
+        value: "true"
+      - key: TP_PCT
+        value: "1.5"
+      - key: SL_PCT
+        value: "1.0"
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

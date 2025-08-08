@@ -1,6 +1,6 @@
-# main.py — MarloTrader (smart mode)
+# main.py — MarloTrader (smart router multi-hop)
 import time, traceback
-from collections import defaultdict
+from collections import defaultdict, deque
 from logger_setup import setup_logger
 from config import CFG
 from exchange import Ku
@@ -9,20 +9,17 @@ from telegram_alerts import send_alert
 
 logger = setup_logger()
 
-# Mémoire simple (perdue au redémarrage)
-# positions[symbol] = {"entry": float, "size": float}
-positions = {}
-cooldown = defaultdict(float)  # symbol -> next_allowed_ts
+# === Mémoire positions (volatile) ===
+positions = {}                # positions[symbol] = {"entry": float, "size": float}
+cooldown  = defaultdict(float)  # symbol -> next_allowed_ts
 
-# ---------- Utils marché / sizing ----------
+# === Helpers sizing / marché ===
 def calc_order_size_quote(free_quote):
-    """Montant à engager dans la monnaie de cotation (USDT/BTC/...)."""
-    rp = max(1.0, min(CFG["RISK_PCT"], 100.0))
+    rp = max(1.0, min(CFG.get("RISK_PCT", 10.0), 100.0))
     size = free_quote * (rp / 100.0)
-    return max(size, CFG["MIN_TRADE_USDT"])
+    return max(size, CFG.get("MIN_TRADE_USDT", 10.0))
 
 def ensure_qty(exchange, symbol, quote_amount):
-    """Calcule une quantité respectant les increments et minFunds."""
     smap = exchange.symbols_map()[symbol]
     price_tick = float(smap['priceIncrement'])
     size_step  = float(smap['baseIncrement'])
@@ -34,12 +31,9 @@ def ensure_qty(exchange, symbol, quote_amount):
     return max(qty, 0.0), bid, price_tick
 
 def atr_pct(kl, period=14):
-    """ATR% simple sur bougies KuCoin (15m par défaut ailleurs)."""
-    if len(kl) < period + 1:
-        return 0.0
+    if len(kl) < period + 1: return 0.0
     trs = []
     for i in range(1, len(kl)):
-        # kline KuCoin: [time, open, close, high, low, volume, turnover]
         _, o, c, h, l, *_ = kl[i]
         prev_c = float(kl[i-1][2])
         h, l, c = float(h), float(l), float(c)
@@ -50,104 +44,112 @@ def atr_pct(kl, period=14):
     return (avg_tr / last_close) * 100 if last_close > 0 else 0.0
 
 def free_after_reserve(quote, free_quote):
-    """Garde une petite réserve pour éviter le blocage complet."""
-    if quote == "USDT":
-        return max(0.0, free_quote - CFG.get("RESERVE_USDT", 20.0))
-    if quote == "BTC":
-        return max(0.0, free_quote - CFG.get("RESERVE_BTC", 0.0002))
+    if quote == "USDT": return max(0.0, free_quote - CFG.get("RESERVE_USDT", 20.0))
+    if quote == "BTC":  return max(0.0, free_quote - CFG.get("RESERVE_BTC", 0.0002))
     return free_quote
 
 def allocation_pct(ex, base, quote):
-    """Part approximative déjà allouée à 'base' (en % du capital sur cette quote)."""
-    base_bal = ex.balance('trade', base)
+    base_bal   = ex.balance('trade', base)
     quote_free = ex.balance('trade', quote)
     pair = f"{base}-{quote}"
     price = float(ex.ticker(pair)['price']) if pair in ex.symbols_map() else 0.0
     pos_val = base_bal * price
-    total = pos_val + quote_free
+    total   = pos_val + quote_free
     return (pos_val / total * 100) if total > 0 else 0.0
 
-# ---------- TP / SL (gérés côté bot) ----------
-def maybe_place_tp_sl(symbol, entry_price):
-    if not CFG["ENABLE_TP_SL"]:
-        return
-    tp = entry_price * (1 + CFG["TP_PCT"]/100.0)
-    sl = entry_price * (1 - CFG["SL_PCT"]/100.0)
-    logger.info(f"{symbol} TP/SL armés → TP≈{tp:.6f} (+{CFG['TP_PCT']}%), SL≈{sl:.6f} (-{CFG['SL_PCT']}%)")
+# === TP/SL côté bot ===
+def maybe_place_tp_sl(symbol, entry):
+    if not CFG.get("ENABLE_TP_SL", True): return
+    tp = entry * (1 + CFG.get("TP_PCT", 1.5)/100.0)
+    sl = entry * (1 - CFG.get("SL_PCT", 1.0)/100.0)
+    logger.info(f"{symbol} TP/SL armés → TP≈{tp:.6f} (+{CFG.get('TP_PCT',1.5)}%), SL≈{sl:.6f} (-{CFG.get('SL_PCT',1.0)}%)")
     send_alert(f"{symbol} TP/SL armés → TP≈{tp:.6f} / SL≈{sl:.6f}")
 
 def check_positions_for_tp_sl(ex, symbols_to_check):
-    if not positions or not CFG["ENABLE_TP_SL"]:
-        return
+    if not positions or not CFG.get("ENABLE_TP_SL", True): return
     smap = ex.symbols_map()
     for symbol in symbols_to_check:
-        if symbol not in positions or symbol not in smap:
-            continue
+        if symbol not in positions or symbol not in smap: continue
         entry = positions[symbol]["entry"]
         size  = positions[symbol]["size"]
         last  = float(ex.ticker(symbol)['price'])
-        tp = entry * (1 + CFG["TP_PCT"]/100.0)
-        sl = entry * (1 - CFG["SL_PCT"]/100.0)
+        tp = entry * (1 + CFG.get("TP_PCT", 1.5)/100.0)
+        sl = entry * (1 - CFG.get("SL_PCT", 1.0)/100.0)
         if last >= tp:
             res = ex.place_order(symbol, "sell", size=str(size), type_="market")
-            logger.info(f"{symbol} SELL TP -> {res}")
-            send_alert(f"TP atteint ✅ {symbol} ~{last:.6f}")
+            logger.info(f"{symbol} SELL TP -> {res}"); send_alert(f"TP atteint ✅ {symbol} ~{last:.6f}")
             positions.pop(symbol, None)
         elif last <= sl:
             res = ex.place_order(symbol, "sell", size=str(size), type_="market")
-            logger.info(f"{symbol} SELL SL -> {res}")
-            send_alert(f"SL déclenché ❌ {symbol} ~{last:.6f}")
+            logger.info(f"{symbol} SELL SL -> {res}"); send_alert(f"SL déclenché ❌ {symbol} ~{last:.6f}")
             positions.pop(symbol, None)
 
-# ---------- Smart router (conversion automatique multi-quotes) ----------
+# === Smart Router (multi-hop) ===
 def best_price(ex, pair, side):
     t = ex.ticker(pair)
     return float(t['bestAsk']) if side == "buy" else float(t['bestBid'])
 
-def route_to_quote(ex, target_quote: str, min_needed: float):
-    """
-    Assure 'target_quote' dispo en convertissant depuis une autre quote listée
-    dans CFG['QUOTES'] via un pont direct (ex: BTC<->USDT).
-    """
-    if min_needed <= 0:
-        return
+def quotes_graph(ex):
+    """Graphe dirigé entre quotes à partir des marchés dispo (ex: BTC-USDT crée arêtes BTC->USDT et USDT->BTC)."""
+    g = defaultdict(set)
     smap = ex.symbols_map()
-    quotes = CFG["QUOTES"]
+    for sym in smap.keys():
+        base, quote = sym.split('-')
+        g[base].add(quote)   # on peut vendre BASE pour obtenir QUOTE
+        g[quote].add(base)   # on peut acheter BASE en payant QUOTE
+    return g
 
-    for q in quotes:
-        if q == target_quote:
-            continue
-        bal = ex.balance('trade', q)
-        if bal <= 0:
-            continue
+def find_quote_path(ex, start_q, target_q, max_hops=3):
+    """BFS simple sur les quotes (USDT/BTC/...) pour trouver un chemin court."""
+    if start_q == target_q: return [start_q]
+    g = quotes_graph(ex)
+    seen = {start_q}; dq = deque([(start_q, [start_q])])
+    while dq:
+        cur, path = dq.popleft()
+        if len(path) > max_hops + 1: continue
+        for nxt in g[cur]:
+            if nxt in seen: continue
+            np = path + [nxt]
+            if nxt == target_q: return np
+            seen.add(nxt); dq.append((nxt, np))
+    return None
 
-        # q -> target_quote
-        direct1 = f"{q}-{target_quote}"      # vendre q contre target_quote
-        direct2 = f"{target_quote}-{q}"      # acheter target_quote en payant q
+def execute_quote_path(ex, path, amount_in_start):
+    """
+    Exécute la conversion le long du chemin de quotes.
+    amount_in_start: montant dispo dans la quote de départ.
+    On convertit 'juste ce qu'il faut' pour atteindre la taille minimale d'achat.
+    """
+    if not path or len(path) == 1: return
+    smap = ex.symbols_map()
 
-        if direct1 in smap:
-            px = best_price(ex, direct1, side="sell")
-            need_q = min_needed / px if px > 0 else 0
-            size = min(bal, need_q)
-            if size > 0:
-                logger.info(f"[Router] {q}→{target_quote} via {direct1} (sell {size} {q})")
-                ex.place_order(direct1, "sell", size=str(size), type_="market")
-                return
+    amt = amount_in_start
+    for i in range(len(path)-1):
+        q_from = path[i]
+        q_to   = path[i+1]
+        # Cherche une paire utilisable entre q_from et q_to
+        pair_sell = f"{q_from}-{q_to}"   # on vend q_from (BASE) pour obtenir q_to
+        pair_buy  = f"{q_to}-{q_from}"   # on achète q_to (BASE) en payant q_from
 
-        if direct2 in smap:
-            px = best_price(ex, direct2, side="buy")
-            size_base = min_needed / px if px > 0 else 0  # BASE = target_quote
-            if size_base > 0:
-                affordable = bal / px if px > 0 else 0
-                size = min(size_base, affordable)
-                if size > 0:
-                    logger.info(f"[Router] {q}→{target_quote} via {direct2} (buy {size} {target_quote})")
-                    ex.place_order(direct2, "buy", size=str(size), type_="market")
-                    return
+        if pair_sell in smap:
+            px = best_price(ex, pair_sell, side="sell")
+            size_base = amt  # taille en BASE = q_from
+            if size_base <= 0: break
+            logger.info(f"[Router] {q_from}→{q_to} via {pair_sell} (sell {size_base} {q_from})")
+            ex.place_order(pair_sell, "sell", size=str(size_base), type_="market")
+            amt = size_base * px  # reçu en q_to (approx)
+        elif pair_buy in smap:
+            px = best_price(ex, pair_buy, side="buy")
+            size_base = amt / px if px > 0 else 0  # BASE = q_to
+            if size_base <= 0: break
+            logger.info(f"[Router] {q_from}→{q_to} via {pair_buy} (buy {size_base} {q_to})")
+            ex.place_order(pair_buy, "buy", size=str(size_base), type_="market")
+            amt = size_base  # maintenant on détient q_to en 'size_base'
+        else:
+            logger.info(f"[Router] Pas de marché direct entre {q_from} et {q_to}, arrêt.")
+            break
 
-    logger.info(f"[Router] Pas de route simple vers {target_quote} ou soldes insuffisants.")
-
-# ---------- Boucle principale ----------
+# === Boucle principale ===
 def run_loop():
     logger.info(f"Config: {CFG}")
     ex = Ku(logger)
@@ -155,45 +157,44 @@ def run_loop():
     if drift > 15000:
         logger.warning("Time drift élevé, pense à resynchroniser l'horloge du serveur.")
 
+    MAX_HOPS   = int(CFG.get("ROUTER_MAX_HOPS", 3))
+    MIN_ATR    = float(CFG.get("MIN_ATR_PCT", 0.3))
+    COOLDOWN   = int(CFG.get("COOLDOWN_SEC", 90))
+    MAX_ALLOC  = float(CFG.get("MAX_POS_ALLOCATION_PCT", 50.0))
+
     while True:
         try:
             smap = ex.symbols_map()
-            now = time.time()
+            now  = time.time()
 
             for quote in CFG["QUOTES"]:
-                # Solde libre avec réserve
-                free_q = ex.balance('trade', quote)
-                free_q = free_after_reserve(quote, free_q)
+                free_q = free_after_reserve(quote, ex.balance('trade', quote))
                 logger.info(f"[{quote}] balance libre (après réserve): {free_q}")
 
-                # Symboles correspondant à cette quote
                 symbols_for_quote = [s for s in CFG["SYMBOLS"] if s.endswith(f"-{quote}")]
-
-                # Gestion TP/SL en priorité
                 check_positions_for_tp_sl(ex, symbols_for_quote)
 
                 for symbol in symbols_for_quote:
-                    # Pair fallback auto (si la paire n'existe pas, on tente une autre quote)
+                    # fallback si la paire n'existe pas (ex: SOL-BTC -> SOL-USDT)
                     if symbol not in smap:
                         base, _ = symbol.split('-')
                         fallback = None
                         for q2 in CFG["QUOTES"]:
                             alt = f"{base}-{q2}"
                             if alt in smap:
-                                fallback = alt
-                                break
+                                fallback = alt; break
                         if not fallback:
                             logger.warning(f"{symbol} introuvable, aucune alternative trouvée.")
                             continue
                         logger.info(f"{symbol} introuvable → fallback sur {fallback}")
                         symbol = fallback
 
-                    if now < cooldown[symbol]:
+                    if now < cooldown[symbol]: 
                         continue
 
-                    base, quote_curr = symbol.split('-')
+                    base, q_cur = symbol.split('-')
 
-                    # Si on démarre avec un solde base déjà présent, on enregistre la position
+                    # init position connue si solde présent au démarrage
                     base_bal = ex.balance('trade', base)
                     if base_bal > 0 and symbol not in positions:
                         last = float(ex.ticker(symbol)['price'])
@@ -201,10 +202,10 @@ def run_loop():
                         logger.info(f"{symbol} position détectée → entry≈{last:.6f}, size={base_bal}")
                         maybe_place_tp_sl(symbol, last)
 
-                    # Données marché + signal
+                    # marché & signal
                     kl = ex.klines(symbol, "15min", limit=120)
-                    vol = atr_pct(kl, period=14)
-                    if vol < CFG.get("MIN_ATR_PCT", 0.3):
+                    vol = atr_pct(kl, 14)
+                    if vol < MIN_ATR:
                         logger.info(f"{symbol} volatilité faible ({vol:.2f}% ATR), skip.")
                         continue
 
@@ -212,64 +213,75 @@ def run_loop():
                     sig, reason = ema_cross_signal(closes)
                     logger.info(f"{symbol} signal={sig} ({reason})")
 
-                    # SELL si signal + position
+                    # SELL
                     if sig == "sell":
                         base_bal = ex.balance('trade', base)
                         if base_bal > 0:
                             res = ex.place_order(symbol, "sell", size=str(base_bal), type_="market")
-                            logger.info(f"{symbol} SELL market -> {res}")
+                            logger.info(f"{symbol} SELL -> {res}")
                             send_alert(f"SELL {symbol} size={base_bal} (raison: {reason})")
                             positions.pop(symbol, None)
-                            cooldown[symbol] = now + CFG.get("COOLDOWN_SEC", 90)
+                            cooldown[symbol] = now + COOLDOWN
                         continue
 
-                    # BUY si signal
+                    # BUY
                     if sig == "buy":
-                        # anti-empilement
                         if ex.balance('trade', base) > 0 or symbol in positions:
-                            logger.info(f"{symbol} déjà en position, skip buy.")
+                            logger.info(f"{symbol} déjà en position, skip.")
                             continue
 
-                        # allocation max par actif
-                        alloc = allocation_pct(ex, base, quote_curr)
-                        if alloc >= CFG.get("MAX_POS_ALLOCATION_PCT", 50.0):
-                            logger.info(f"{symbol} allocation {alloc:.1f}% >= max {CFG['MAX_POS_ALLOCATION_PCT']}%, skip.")
+                        alloc = allocation_pct(ex, base, q_cur)
+                        if alloc >= MAX_ALLOC:
+                            logger.info(f"{symbol} allocation {alloc:.1f}% >= max {MAX_ALLOC}%, skip.")
                             continue
 
-                        # s'il manque de quote, on route automatiquement (ex: manque d'USDT, on vend un peu de BTC -> USDT)
-                        free_here = free_after_reserve(quote_curr, ex.balance('trade', quote_curr))
-                        if free_here < CFG["MIN_TRADE_USDT"]:
-                            need = CFG["MIN_TRADE_USDT"] - free_here
-                            route_to_quote(ex, quote_curr, need)
-                            free_here = free_after_reserve(quote_curr, ex.balance('trade', quote_curr))
-                            if free_here < CFG["MIN_TRADE_USDT"]:
-                                logger.info(f"{symbol} pas assez de {quote_curr} après routage, skip.")
+                        # S'il manque de quote pour acheter, on fait du routing multi-hop
+                        free_here = free_after_reserve(q_cur, ex.balance('trade', q_cur))
+                        if free_here < CFG.get("MIN_TRADE_USDT", 10.0):
+                            need = CFG.get("MIN_TRADE_USDT", 10.0) - free_here
+                            # Choisir la meilleure quote de départ (celle où on a du solde)
+                            start_quotes = sorted(CFG["QUOTES"], key=lambda q: ex.balance('trade', q), reverse=True)
+                            path_found = False
+                            for q_start in start_quotes:
+                                if q_start == q_cur: 
+                                    continue
+                                bal_start = free_after_reserve(q_start, ex.balance('trade', q_start))
+                                if bal_start <= 0: 
+                                    continue
+                                path = find_quote_path(ex, q_start, q_cur, MAX_HOPS)
+                                if path:
+                                    logger.info(f"[Router] chemin trouvé {path} pour obtenir {q_cur}")
+                                    # On convertit juste le nécessaire (need), limité par bal_start
+                                    amt = min(bal_start, need if q_start != "BTC" else bal_start)  # simple borne
+                                    execute_quote_path(ex, path, amt)
+                                    path_found = True
+                                    break
+                            # refresh après routage
+                            free_here = free_after_reserve(q_cur, ex.balance('trade', q_cur))
+                            if not path_found or free_here < CFG.get("MIN_TRADE_USDT", 10.0):
+                                logger.info(f"{symbol} pas assez de {q_cur} après routage, skip.")
                                 continue
 
                         quote_amt = calc_order_size_quote(free_here)
                         qty, bid, _ = ensure_qty(ex, symbol, quote_amt)
                         if qty <= 0:
-                            logger.info(f"{symbol} qty<=0, skip")
+                            logger.info(f"{symbol} qty<=0, skip.")
                             continue
 
                         res = ex.place_order(symbol, "buy", size=str(qty), type_="market")
-                        logger.info(f"{symbol} BUY market -> {res}")
+                        logger.info(f"{symbol} BUY -> {res}")
                         send_alert(f"BUY {symbol} qty={qty} (raison: {reason})")
-
                         entry = float(ex.ticker(symbol)['price'])
                         positions[symbol] = {"entry": entry, "size": qty}
                         maybe_place_tp_sl(symbol, entry)
-                        cooldown[symbol] = now + CFG.get("COOLDOWN_SEC", 90)
+                        cooldown[symbol] = now + COOLDOWN
 
-            time.sleep(CFG["POLL_INTERVAL_SEC"])
+            time.sleep(CFG.get("POLL_INTERVAL_SEC", 30))
 
         except KeyboardInterrupt:
-            logger.info("Arrêt manuel.")
-            break
+            logger.info("Arrêt manuel."); break
         except Exception as e:
-            logger.error(f"Loop error: {e}\n{traceback.format_exc()}")
-            send_alert(f"Erreur loop: {e}")
-            time.sleep(5)
+            logger.error(f"Loop error: {e}\n{traceback.format_exc()}"); send_alert(f"Erreur loop: {e}"); time.sleep(5)
 
 if __name__ == "__main__":
     run_loop()
